@@ -561,6 +561,63 @@ fn shell_path_selfcheck() {
     }
 }
 
+/// ADR-038 U1/D5：真实 C 用户态 `fork()` 端到端自检。
+///
+/// # 为什么这一条必须存在（与内核侧 e2e 的分工）
+///
+/// `kernel::tests::test_task_derive_e2e` 走的是**内核自建帧**的 syscall 路径：它直接
+/// 构造 `InterruptFrame` 调 `syscall_entry`，验证的是**内核语义**（子进程首跑帧、
+/// 新线程组、COW 共享与隔离、帧引用计数归位）。
+///
+/// 但它盖不住「**真实用户态代码**经 `int 0x80` 进来、再从 `fork()` 内部返回两次」
+/// 这条整链：
+///   - 子进程从 syscall 返回后，用户态栈/寄存器/代码段是否完好（fork 最易崩的地方）；
+///   - csrc 的 C 运行时（crt0.S + crtrt.c）与 libc 的 ABI 是否一致；
+///   - `waitpid` 经 **r10** 交付被收尸 pid、经 **rax** 交付退出码的双通道协议在
+///     用户态是否被正确读取（只看 rax 会拿到退出码却拿不到 pid）。
+///
+/// 本自检用 shell 的非交互模式（argv 即整行命令）拉起 `/programs/forkdemo.elf`，
+/// 与用户在命令行敲完全同一条路径（ADR-029 的既有手法）。
+///
+/// `/programs/forkdemo.elf` 是**真正的 freestanding C**（csrc/prog/forkdemo.c，
+/// 经 clang/lld 交叉链编译，零 Rust libc，S35），它自己打印 [forkdemo] OK/FAIL 行。
+/// 本函数只负责拉起、收尸、并把**退出码**作为证据输出——forkdemo 以 0 退出即
+/// 全部断言通过，非 0 即失败条数。
+fn forkdemo_launch() {
+    let _ = write(STDOUT, b"[forkdemo-check] --- real C userland fork()+waitpid() ---\n");
+    // 经 shell 非交互模式执行，与用户手敲同路径。
+    let cmd: &[u8] = b"/programs/forkdemo.elf";
+    let pid = match libsys::exec_path("/programs/shell.elf", cmd) {
+        Ok(p) => p,
+        Err(_) => {
+            // S09：拉不起来就如实说，绝不假装验过。
+            let _ = write(STDOUT, b"[forkdemo-check] FAILED to spawn shell (cannot run forkdemo)\n");
+            return;
+        }
+    };
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == pid => {
+                let mut b = [0u8; 8];
+                let _ = write(STDOUT, b"[forkdemo-check] shell exited with code ");
+                let _ = write(STDOUT, dec_u64(wr.code, &mut b));
+                let _ = write(STDOUT, b" (0 = forkdemo PASS, N = N failed assertions)\n");
+                return;
+            }
+            Ok(_) => continue, // 别人的退出码：继续等本 pid
+            Err(_) => {
+                spins += 1;
+                if spins > 80000 {
+                    let _ = write(STDOUT, b"[forkdemo-check] reap timeout (non-fatal)\n");
+                    return;
+                }
+                let _ = libsys::yield_now();
+            }
+        }
+    }
+}
+
 /// `audiofile` 端到端自检：真实播放一个真实 WAV 文件。
 ///
 /// **为何必须有这个自检**：`audiofile` 的价值在于「真的放出声」这条完整链路
@@ -735,16 +792,39 @@ fn dec_u64(v: u64, buf: &mut [u8; 8]) -> &[u8] {
 /// 分组判定：argv[1]（若有）。
 ///   audio  -> 音频组；thread -> 线程组；quick -> 信号+libc+shell 路径；
 ///   无参   -> 全量。
+///
+/// # 参数实际落在 argv[0]，不是 argv[1]（本轮定位的真实缺陷）
+///
+/// 内核的用户栈参数块 mini-ABI **恒为 `argc = 1`**：整条命令行作为一个 C 串放在
+/// `argv[0]`（`loader/src/lib.rs::setup_user_stack` 的 `*rp = 1; *rp.add(1) = str_user;`，
+/// 第三格写 0 终结）。内核**不做**按空格切分。
+///
+/// 于是链路上：shell `exec_line` 切出 `arg` -> `cmd_selftest(arg)` ->
+/// `exec_path("/programs/selftest.elf", arg)` -> `arg` 成为新进程的 `argv[0]`。
+///
+/// 旧实现读的是 `argv[1]`，而 `argc` 恒为 1 —— 它要么走 `argc <= 1` 短路（永远
+/// 「全量」），要么在短路不成立时越界读 `argv[1]`（该位置是终结用的 NULL）。
+/// 两个后果都指向同一件事：**分组过滤从未生效**，`selftest thread` 一直在跑全量
+/// 套件（含最耗时的 SIGKILL 风暴）。旧注释「i=1 < argc 恒在界内」正是该缺陷的
+/// 成文形态——它把一个恒不成立的假设写成了安全依据。
+///
+/// 故改为读 `argv[0]`，并在为空时不匹配任何组（`argc == 0` 或空串 = 无参 = 全量，
+/// 由调用方 `user_main` 的 `argc <= 1` 分支处理「全量」的**显示**，此处只做匹配）。
 fn group_enabled(argc: isize, argv: *const *const u8, g: &[u8]) -> bool {
-    if argc <= 1 {
-        return true; // 无参 = 全量
+    // 无 argv（argc == 0）或 argv 数组为空 -> 无参，视为全量。
+    if argc <= 0 || argv.is_null() {
+        return true;
     }
-    // SAFETY: argv[1] 由内核 exec 路径传 NUL 结尾 C 串；i=1 < argc 恒在界内。
-    let sp = unsafe { *argv.add(1) };
+    // SAFETY: argc >= 1，故 argv[0] 在界内；由内核 exec 路径构造为 NUL 结尾 C 串。
+    let sp = unsafe { *argv };
     if sp.is_null() {
-        return false;
+        return true; // 空串 = 无参 = 全量
     }
     let mut j = 0usize;
+    // SAFETY: sp 指向 NUL 结尾 C 串。
+    if unsafe { *sp } == 0 {
+        return true; // 空串 = 无参 = 全量
+    }
     let mut same = true;
     loop {
         // SAFETY: 同上，C 字符串以 NUL 结尾。
@@ -767,21 +847,28 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     let thread = group_enabled(argc, argv, b"thread");
     let quick = group_enabled(argc, argv, b"quick");
     let _ = write(STDOUT, b"[selftest] start (group=");
-    if argc <= 1 {
-        let _ = write(STDOUT, b"all");
-    } else {
-        // SAFETY: 同 group_enabled，argv[1] 在界内。
-        let sp = unsafe { *argv.add(1) };
-        let mut j = 0usize;
-        // SAFETY: C 字符串以 NUL 结尾。
-        loop {
-            let b = unsafe { *sp.add(j) };
-            if b == 0 {
-                break;
+    // 回显**实际生效**的组名：与 group_enabled 同源（argv[0]），不是 argv[1]。
+    // 无参或空串时回显 all——与 group_enabled 返回 true 的语义一致。
+    let mut showed = false;
+    if argc > 0 && !argv.is_null() {
+        // SAFETY: argc > 0，argv[0] 在界内；内核构造为 NUL 结尾 C 串。
+        let sp = unsafe { *argv };
+        if !sp.is_null() && unsafe { *sp } != 0 {
+            let mut j = 0usize;
+            // SAFETY: C 字符串以 NUL 结尾。
+            loop {
+                let b = unsafe { *sp.add(j) };
+                if b == 0 {
+                    break;
+                }
+                let _ = write(STDOUT, &[b]);
+                j += 1;
             }
-            let _ = write(STDOUT, &[b]);
-            j += 1;
+            showed = true;
         }
+    }
+    if !showed {
+        let _ = write(STDOUT, b"all");
     }
     let _ = write(STDOUT, b")\n");
 
@@ -796,6 +883,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         pthreaddemo_launch();
         pthread_syncdemo_launch();
         launch_c_prog("/programs/pthread_bench.elf", "pthread_bench");
+        // ADR-038 U1/D5：真实 C 用户态 fork()+waitpid() 端到端（零 Rust libc），
+        // 经 shell 非交互模式（argv = 整行命令）拉起，与用户手敲同路径。
+        forkdemo_launch();
     }
     if audio {
         audio_e2e_launch();
