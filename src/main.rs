@@ -876,6 +876,11 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         signal_selftest();
         libc_selftest();
         shell_path_selfcheck();
+        // A2-5：POSIX 账户查询（getpwnam/getpwuid）的**独立进程**真实链路验收。
+        // 与 libccheck 互补——libccheck 在 shell 进程内跑，本项是独立进程经 libc
+        // 静态链接调用，覆盖跨进程读表与静态返回缓冲生命周期（ADR-040 §3.5.4
+        // "不得止于单测，必须有真实用户态链路"）。
+        launch_c_prog("/programs/pwde2e.elf", "pwde2e");
     }
     if thread {
         threaddemo_launch();
