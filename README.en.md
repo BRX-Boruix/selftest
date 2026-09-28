@@ -1,44 +1,26 @@
 # selftest
 
-BORUIX's **system self-test host**: it starts the self-test items on demand and summarises the results.
+BORUIX's on-demand self-test host: organises signal, C library, thread, audio and shell-path tests into groups and runs them when asked.
 
 [简体中文](README.md)
 
-## Using it
+## Usage
 
-```
-selftest            run everything
-selftest quick      quick group (signals + C library + shell paths, seconds)
-selftest audio      audio group
-selftest thread     thread group
-```
+Started by a shell builtin; the group argument selects what runs:
 
-**Why self-testing is not part of the boot flow**: the self-test is a test workload "run for a human to watch", with no real-time observation value, and the full run includes several stretches of real-time audio streaming that would delay the `shell` by minutes. It now lives entirely in this program, started on demand by a `shell` command — **boot goes straight to the `shell`**.
+- `selftest` — everything, including the cross-core kill storm
+- `selftest quick` — signals, C library, shell path, account look-up; done in seconds
+- `selftest thread` — the thread group: multithread demo, the C pthread family and its benchmark, a fork round-trip
+- `selftest audio` — the audio group: blocking wake round-trip, player positive and negative cases
 
-## Coverage
+The effective group name is echoed at start; with no argument it prints `all`. Each test prints its
+own pass or fail line, and the run ends with `[selftest] done`. The exit code is always 0; read the
+output lines for the verdict.
 
-| Group | Contents |
-| --- | --- |
-| Signals | Signal delivery and disposition; process termination under a `SIGKILL` storm |
-| C library | Allocation, strings, formatted output, numeric conversion, time, and related paths |
-| Shell paths | Starting `shell` with several different arguments, covering three classes of load outcome |
-| Threads | Thread creation and scheduling, per-thread `errno`, thread-local storage, shared address space |
-| Audio | Audio-domain blocking round trips; WAV playback positive and negative cases |
+## Known limitations
 
-Several items run as **real child processes**, taking the genuine load and execute paths rather than being simulated in-process.
-
-## Arguments
-
-The group argument is passed as a **startup argument** (`selftest <group>` in the shell). An empty or absent argument means **everything**.
-
-The program echoes the group name **actually in effect** at startup, so you can confirm the argument was interpreted correctly.
-
-## Exit codes
-
-| Exit code | Meaning |
-| --- | --- |
-| `0` | All selected groups passed |
-| Non-zero | Some items failed |
+- The audio group's round-trip needs the exclusive audio consumer slot; when the hardware driver is resident that slot is taken, and the item prints SKIP rather than FAIL
+- Full mode takes the longest and launches stress programs
 
 ## Building
 
@@ -46,24 +28,23 @@ The program echoes the group name **actually in effect** at startup, so you can 
 cargo build --release
 ```
 
-The artifact is deployed as `/programs/selftest.elf`.
-
-## Layout
+## Repository layout
 
 ```
 selftest/
-├── Cargo.toml    # package definition
+├── Cargo.toml    # package manifest
 ├── build.rs      # injects the linker script
-├── linker.ld     # user-space section layout
+├── linker.ld     # user-space segment layout
 └── src/
-    └── main.rs   # group dispatch and the individual tests
+    └── main.rs   # test groups and spawn coordination
 ```
 
 ## Related projects
 
-- [`shell`](https://github.com/BRX-Boruix/shell) — provides the `selftest` command
-- [`pwde2e`](https://github.com/BRX-Boruix/pwde2e), [`acee2e`](https://github.com/BRX-Boruix/acee2e), [`trave2e`](https://github.com/BRX-Boruix/trave2e) — standalone acceptance programs this host starts
-- [`libsys`](https://github.com/BRX-Boruix/libsys) — the user-space syscall wrapper
+- [`threaddemo`](https://github.com/BRX-Boruix/threaddemo) — spawned by the thread group
+- [`audioe2e`](https://github.com/BRX-Boruix/audioe2e) — the audio group's round-trip test
+- [`pwde2e`](https://github.com/BRX-Boruix/pwde2e) — account look-up acceptance spawned by quick
+- [`shell`](https://github.com/BRX-Boruix/shell) — the builtin that starts this program
 
 ## License
 
