@@ -840,6 +840,94 @@ fn group_enabled(argc: isize, argv: *const *const u8, g: &[u8]) -> bool {
     same
 }
 
+/// 3P4-4：mmap 的 prot 通道与 W^X 单点门禁（selftest mm）。
+///
+/// 判据：
+/// 1. RX 映射成功，且该页**确实不可写**（反向证据：页先被读触碰补页成"已存在"，
+///    再用带写意图的 syscall 缓冲写它——必须失败；若只测未补页的页，拿到的是
+///    "未分配"而非"不可写"，是假阴性）；
+/// 2. **W+X 被响亮拒绝**（不静默降级——否则调用方以为拿到了可写可执行页）；
+/// 3. RW（默认）映射成功；
+/// 4. 未知 prot 位被拒绝（权限位不静默忽略）。
+///
+/// 诚实边界：从 RX 页**执行代码**需要"先写后切权限"，那是 3P4-5（mprotect）的验收面；
+/// 本项只能证明 RX 映射可建立且不可写。系统级证据是：本程序自身就跑在加载器建立的
+/// RX 代码段上。
+fn mm_selftest() {
+    let mut ok = true;
+    let page = 4096u64;
+
+    // ---- 1. RX 建立 + 不可写 ----
+    match libsys::mmap_prot(page, libsys::PROT_READ | libsys::PROT_EXEC) {
+        Ok(va) => {
+            // 读触碰 → 按需补页，且按区域权限（RX）映射。
+            let touch = unsafe { core::ptr::read_volatile(va as *const u8) };
+            let _ = touch;
+            // 现在页已存在且为 RX：写意图必须被内核如实拒绝（不崩、返回错误）。
+            let mut rejected = false;
+            if let Ok(fd) = libsys::open(
+                "/programs/fpcheck.elf",
+                libsys::OpenFlags::READ_ONLY,
+                libsys::Permissions::readonly(),
+            ) {
+                let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, 16) };
+                if libsys::read(fd, buf).is_err() {
+                    rejected = true;
+                }
+                let _ = libsys::close(fd);
+            }
+            if rejected {
+                let _ = write(STDOUT, b"[mm] RX mapping OK + RX page not writable OK\n");
+            } else {
+                ok = false;
+                let _ = write(STDOUT, b"[mm] RX page accepted a write (W^X broken)\n");
+            }
+        }
+        Err(_) => {
+            ok = false;
+            let _ = write(STDOUT, b"[mm] RX mmap failed\n");
+        }
+    }
+
+    // ---- 2. W+X 必须被拒 ----
+    match libsys::mmap_prot(
+        page,
+        libsys::PROT_READ | libsys::PROT_WRITE | libsys::PROT_EXEC,
+    ) {
+        Ok(_) => {
+            ok = false;
+            let _ = write(STDOUT, b"[mm] W+X was NOT rejected\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[mm] W+X rejected OK\n");
+        }
+    }
+
+    // ---- 3. RW（默认权限）成功 ----
+    match libsys::mmap_prot(page, libsys::PROT_READ | libsys::PROT_WRITE) {
+        Ok(_) => {
+            let _ = write(STDOUT, b"[mm] RW mapping OK\n");
+        }
+        Err(_) => {
+            ok = false;
+            let _ = write(STDOUT, b"[mm] RW mmap failed\n");
+        }
+    }
+
+    // ---- 4. 未知位拒绝 ----
+    match libsys::mmap_prot(page, 1 << 9) {
+        Ok(_) => {
+            ok = false;
+            let _ = write(STDOUT, b"[mm] unknown prot bit was accepted\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[mm] unknown prot bit rejected OK\n");
+        }
+    }
+
+    let _ = write(STDOUT, if ok { b"[mm] PASS\n" as &[u8] } else { b"[mm] FAIL\n" });
+}
+
 /// 解析 `--read-fd=N`（3P4-3 验收的子进程侧入口）。
 ///
 /// 走 libsys 的入口参数单点（`cmdline`）——shell 派生时已剥去程序名，
@@ -1042,6 +1130,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     let thread = group_enabled(argc, argv, b"thread");
     let quick = group_enabled(argc, argv, b"quick");
     let fs = group_enabled(argc, argv, b"fs");
+    let mm = group_enabled(argc, argv, b"mm");
     let _ = write(STDOUT, b"[selftest] start (group=");
     // 回显**实际生效**的组名：与 group_enabled 同源（argv[0]），不是 argv[1]。
     // 无参或空串时回显 all——与 group_enabled 返回 true 的语义一致。
@@ -1090,6 +1179,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     }
     if fs {
         fs_selftest();
+    }
+    if mm {
+        mm_selftest();
     }
     if audio {
         audio_e2e_launch();
