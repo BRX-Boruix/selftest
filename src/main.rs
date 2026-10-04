@@ -1028,6 +1028,7 @@ fn mm_selftest() {
 /// 拿到 5 字节即路径正确；拿到 0x13（= SYS_STREAM_WRITE 的号）之类即命中该缺陷。
 fn pipe_wake_selftest() {
     let mut ok = true;
+    let _ = write(STDOUT, b"[pwake] step1 create pipe\n");
     let (r, w) = match libsys::pipe_create() {
         Ok(v) => v,
         Err(_) => {
@@ -1059,6 +1060,7 @@ fn pipe_wake_selftest() {
         j += 1;
     }
     let cmd = &cmd[..j];
+    let _ = write(STDOUT, b"[pwake] step2 spawn writer\n");
     let child = match libsys::exec_path("/programs/selftest.elf", cmd) {
         Ok(p) => p,
         Err(_) => {
@@ -1068,6 +1070,7 @@ fn pipe_wake_selftest() {
         }
     };
     // 父进程阻塞读：写端开着、无数据。按契约对 WouldBlock 重试。
+    let _ = write(STDOUT, b"[pwake] step3 blocking read\n");
     let mut buf = [0u8; 8];
     let t_start = libsys::now();
     let mut got: Option<usize> = None;
@@ -1102,6 +1105,7 @@ fn pipe_wake_selftest() {
             let _ = write(STDOUT, b"[pwake] blocking read never returned\n");
         }
     }
+    let _ = write(STDOUT, b"[pwake] step4 cleanup\n");
     let _ = libsys::close(r);
     let _ = libsys::close(w);
     let mut spins: u32 = 0;
@@ -1111,7 +1115,7 @@ fn pipe_wake_selftest() {
             Ok(_) => {}
             Err(_) => {
                 spins += 1;
-                if spins > 4_000_000 {
+                if spins > 20_000 {
                     break;
                 }
                 yield_now();
