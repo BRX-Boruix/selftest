@@ -1093,7 +1093,7 @@ fn sig_selftest() {
             ok = false;
             let mut b = [0u8; 8];
             let _ = write(STDOUT, b"[sig] read returned Ok(n=");
-            let _ = write(STDOUT, dec_u64(n, &mut b));
+            let _ = write(STDOUT, dec_u64(n as u64, &mut b));
             let _ = write(STDOUT, b") instead of EINTR\n");
         }
         Err(_) => {
