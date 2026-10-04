@@ -925,6 +925,97 @@ fn mm_selftest() {
         }
     }
 
+    // ---- 5. 3P4-5：mprotect 的 JIT 形态（先写后切执行）+ RW<->RX 反复切换 ----
+    // 取一段 RW 映射 → 写入机器码（mov eax,42; ret）→ mprotect 为 RX → **真的调用它**。
+    // 这是「运行期可执行内存」的端到端证明，也正是 3P4-4 留下的验收面。
+    const CODE: [u8; 6] = [0xB8, 42, 0, 0, 0, 0xC3]; // mov eax, 42; ret
+    match libsys::mmap_prot(page, libsys::PROT_READ | libsys::PROT_WRITE) {
+        Ok(va) => {
+            unsafe {
+                core::ptr::copy_nonoverlapping(CODE.as_ptr(), va as *mut u8, CODE.len());
+            }
+            if libsys::mprotect(va, page, libsys::PROT_READ | libsys::PROT_EXEC).is_err() {
+                ok = false;
+                let _ = write(STDOUT, b"[mm] mprotect RW->RX failed\n");
+            } else {
+                let f: extern "C" fn() -> i32 = unsafe { core::mem::transmute(va as *const ()) };
+                if f() == 42 {
+                    let _ = write(
+                        STDOUT,
+                        b"[mm] JIT: wrote code in RW, switched to RX, executed -> 42 OK\n",
+                    );
+                } else {
+                    ok = false;
+                    let _ = write(STDOUT, b"[mm] JIT call returned wrong value\n");
+                }
+            }
+            // W+X 经 mprotect 同样必须被拒——否则 mprotect 就是绕过 3P4-4 门禁的后门。
+            if libsys::mprotect(
+                va,
+                page,
+                libsys::PROT_READ | libsys::PROT_WRITE | libsys::PROT_EXEC,
+            )
+            .is_err()
+            {
+                let _ = write(STDOUT, b"[mm] mprotect W+X rejected OK\n");
+            } else {
+                ok = false;
+                let _ = write(STDOUT, b"[mm] mprotect W+X was NOT rejected (W^X backdoor!)\n");
+            }
+            // RW<->RX 反复切换（万次）：判据是**没有 TLB 残留**——切回 RX 后用带写意图的
+            // syscall 缓冲写它必须仍失败（旧的可写翻译若残留在任何核上，这里就会成功）。
+            let mut switches_ok = true;
+            for _ in 0..10_000 {
+                if libsys::mprotect(va, page, libsys::PROT_READ | libsys::PROT_WRITE).is_err() {
+                    switches_ok = false;
+                    break;
+                }
+                if libsys::mprotect(va, page, libsys::PROT_READ | libsys::PROT_EXEC).is_err() {
+                    switches_ok = false;
+                    break;
+                }
+            }
+            if !switches_ok {
+                ok = false;
+                let _ = write(STDOUT, b"[mm] 10k RW<->RX switches failed\n");
+            } else {
+                let mut residue = false;
+                if let Ok(fd) = libsys::open(
+                    "/programs/fpcheck.elf",
+                    libsys::OpenFlags::READ_ONLY,
+                    libsys::Permissions::readonly(),
+                ) {
+                    let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, 16) };
+                    residue = libsys::read(fd, buf).is_ok();
+                    let _ = libsys::close(fd);
+                }
+                if residue {
+                    ok = false;
+                    let _ = write(
+                        STDOUT,
+                        b"[mm] TLB residue: RX page accepted a write after 10k switches\n",
+                    );
+                } else {
+                    let _ = write(
+                        STDOUT,
+                        b"[mm] 10k RW<->RX switches, no stale writable translation OK\n",
+                    );
+                }
+                let f: extern "C" fn() -> i32 = unsafe { core::mem::transmute(va as *const ()) };
+                if f() == 42 {
+                    let _ = write(STDOUT, b"[mm] code still executable after 10k switches OK\n");
+                } else {
+                    ok = false;
+                    let _ = write(STDOUT, b"[mm] code broke after 10k switches\n");
+                }
+            }
+        }
+        Err(_) => {
+            ok = false;
+            let _ = write(STDOUT, b"[mm] RW mmap for JIT failed\n");
+        }
+    }
+
     let _ = write(STDOUT, if ok { b"[mm] PASS\n" as &[u8] } else { b"[mm] FAIL\n" });
 }
 
