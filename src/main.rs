@@ -1019,6 +1019,108 @@ fn mm_selftest() {
     let _ = write(STDOUT, if ok { b"[mm] PASS\n" as &[u8] } else { b"[mm] FAIL\n" });
 }
 
+/// 3P4-9 判定用例：**阻塞读被数据唤醒时，必须拿到数据本身**（而不是 syscall 调用号）。
+///
+/// 背景：入口 stub 的成文注释（interrupts.rs:748-753）说明——阻塞类 syscall 的帧会被存进
+/// 进程 saved 现场，之后由时钟中断的 commit_next 做 `*frame = slot.saved` 并经
+/// `interrupt_common_stub` 的 iretq 返回。若该路径**不经过 stub 的 pop rax 回程**，被唤醒
+/// 的 syscall 就会带着陈旧 rax（= 调用号）回到用户态。本用例用最简单的"子写 5 字节"判定：
+/// 拿到 5 字节即路径正确；拿到 0x13（= SYS_STREAM_WRITE 的号）之类即命中该缺陷。
+fn pipe_wake_selftest() {
+    let mut ok = true;
+    let (r, w) = match libsys::pipe_create() {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = write(STDOUT, b"[pwake] pipe_create failed\n");
+            let _ = write(STDOUT, b"[pwake] FAIL\n");
+            return;
+        }
+    };
+    // 子进程：延迟 500ms 后向写端写 HELLO（父进程此刻应已阻塞在 read 上）。
+    let mut cmd = [0u8; 24];
+    let prefix = b"--write-fd=";
+    cmd[..prefix.len()].copy_from_slice(prefix);
+    let mut n = w;
+    let mut digits = [0u8; 20];
+    let mut i = 0usize;
+    if n == 0 {
+        digits[0] = b'0';
+        i = 1;
+    }
+    while n > 0 {
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    let mut j = prefix.len();
+    while i > 0 {
+        i -= 1;
+        cmd[j] = digits[i];
+        j += 1;
+    }
+    let cmd = &cmd[..j];
+    let child = match libsys::exec_path("/programs/selftest.elf", cmd) {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = write(STDOUT, b"[pwake] spawn writer failed\n");
+            let _ = write(STDOUT, b"[pwake] FAIL\n");
+            return;
+        }
+    };
+    // 父进程阻塞读：写端开着、无数据。按契约对 WouldBlock 重试。
+    let mut buf = [0u8; 8];
+    let t_start = libsys::now();
+    let mut got: Option<usize> = None;
+    loop {
+        match libsys::read(r, &mut buf) {
+            Ok(k) => {
+                got = Some(k);
+                break;
+            }
+            Err(libsys::Error::WouldBlock) => {
+                if libsys::now().saturating_sub(t_start) > 5_000_000_000 {
+                    break;
+                }
+                yield_now();
+            }
+            Err(_) => break,
+        }
+    }
+    match got {
+        Some(5) if &buf[..5] == b"HELLO" => {
+            let _ = write(STDOUT, b"[pwake] blocking read woken by data returned the 5 bytes OK\n");
+        }
+        Some(k) => {
+            ok = false;
+            let mut b = [0u8; 8];
+            let _ = write(STDOUT, b"[pwake] blocking read returned ");
+            let _ = write(STDOUT, dec_u64(k as u64, &mut b));
+            let _ = write(STDOUT, b" bytes (expected 5) -- stale-rax suspected\n");
+        }
+        None => {
+            ok = false;
+            let _ = write(STDOUT, b"[pwake] blocking read never returned\n");
+        }
+    }
+    let _ = libsys::close(r);
+    let _ = libsys::close(w);
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == child => break,
+            Ok(_) => {}
+            Err(_) => {
+                spins += 1;
+                if spins > 4_000_000 {
+                    break;
+                }
+                yield_now();
+            }
+        }
+    }
+    let _ = write(STDOUT, if ok { b"[pwake] PASS\n" as &[u8] } else { b"[pwake] FAIL\n" });
+}
+
 /// 3P4-9 / ADR-051：阻塞 syscall 被信号打断 → EINTR（`selftest sig`）。
 ///
 /// 场景：父进程建一根**写端仍打开**的管道（故 read 会真正阻塞），装 SIGUSR1 handler，
@@ -1148,6 +1250,23 @@ fn sig_selftest() {
         }
     }
     let _ = write(STDOUT, if ok { b"[sig] PASS\n" as &[u8] } else { b"[sig] FAIL\n" });
+}
+
+/// 解析 `--write-fd=N`（3P4-9 判定用：稍后向 fd N 写 5 字节）。
+fn write_fd_arg(argc: isize, argv: *const *const u8) -> Option<u64> {
+    let c = unsafe { libsys::cmdline(argc, argv) }?;
+    let s = c.strip_prefix(b"--write-fd=")?;
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.saturating_mul(10).saturating_add((b - b'0') as u64);
+    }
+    Some(n)
 }
 
 /// 解析 `--signal-pid=N`（3P4-9 验收的子进程侧入口）。
@@ -1368,6 +1487,16 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 3P4-9 验收的**子进程侧**入口：`selftest --signal-pid=N` —— 稍后向 N 发 SIGUSR1。
     // 延迟是必需的：要确保父进程**已经阻塞在 read 上**，否则信号先到、父还没进阻塞，
     // 测的就不是 EINTR 而是「返回用户态时的投递」。
+    // 3P4-9 判定用子进程：`selftest --write-fd=N` —— 延迟后向 fd N 写 5 字节。
+    if let Some(fd) = write_fd_arg(argc, argv) {
+        let t0 = libsys::now();
+        while libsys::now().saturating_sub(t0) < 500_000_000 {
+            yield_now();
+        }
+        let _ = libsys::write(fd, b"HELLO");
+        return 0;
+    }
+
     if let Some(pid) = signal_pid_arg(argc, argv) {
         // 延迟 2 秒：父进程在 spawn（要从光盘读 ELF）之后才进 read，100ms 不够——
         // 信号若在阻塞**之前**到达，POSIX 语义下本就不产生 EINTR（那次调用照常阻塞），
@@ -1446,6 +1575,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         mm_selftest();
     }
     if sig {
+        pipe_wake_selftest();
         sig_selftest();
     }
     if audio {
