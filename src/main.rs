@@ -1019,6 +1019,134 @@ fn mm_selftest() {
     let _ = write(STDOUT, if ok { b"[mm] PASS\n" as &[u8] } else { b"[mm] FAIL\n" });
 }
 
+/// 3P4-9 / ADR-051：阻塞 syscall 被信号打断 → EINTR（`selftest sig`）。
+///
+/// 场景：父进程建一根**写端仍打开**的管道（故 read 会真正阻塞），装 SIGUSR1 handler，
+/// 然后 read；子进程延迟后向父发 SIGUSR1。判据**两条都要**：
+/// 1. 父的 read 以 `Interrupted`（EINTR）收场；
+/// 2. handler 真的跑过（只验一条都可能掩盖"信号丢了"或"EINTR 假报"）。
+fn sig_selftest() {
+    let mut ok = true;
+    // 装 handler（复用本文件既有的 SIGUSR1 naked handler）。
+    let handler_addr = init_sigusr1_handler as *const () as usize as u64;
+    if libsys::signal::action(libsys::signal::SIGUSR1, handler_addr, 0).is_err() {
+        let _ = write(STDOUT, b"[sig] signal_action failed\n");
+        let _ = write(STDOUT, b"[sig] FAIL\n");
+        return;
+    }
+    SIG_HANDLER_RAN.store(0, Ordering::SeqCst);
+    // 管道：写端**保持打开**（否则 read 会读成 EOF 而不是阻塞）。
+    let (r, w) = match libsys::pipe_create() {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = write(STDOUT, b"[sig] pipe_create failed\n");
+            let _ = write(STDOUT, b"[sig] FAIL\n");
+            return;
+        }
+    };
+    // 子进程：稍后向本进程发 SIGUSR1。把自己的 pid 作为参数交付。
+    let me = match libsys::getpid() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = write(STDOUT, b"[sig] getpid failed\n");
+            let _ = write(STDOUT, b"[sig] FAIL\n");
+            return;
+        }
+    };
+    let mut cmd = [0u8; 32];
+    let prefix = b"--signal-pid=";
+    cmd[..prefix.len()].copy_from_slice(prefix);
+    let mut n = me;
+    let mut digits = [0u8; 20];
+    let mut i = 0usize;
+    if n == 0 {
+        digits[0] = b'0';
+        i = 1;
+    }
+    while n > 0 {
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    let mut j = prefix.len();
+    while i > 0 {
+        i -= 1;
+        cmd[j] = digits[i];
+        j += 1;
+    }
+    let cmd = &cmd[..j];
+    let child = match libsys::exec_path("/programs/selftest.elf", cmd) {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = write(STDOUT, b"[sig] spawn signaller failed\n");
+            let _ = write(STDOUT, b"[sig] FAIL\n");
+            return;
+        }
+    };
+    // 阻塞读：写端开着、无数据 → 真正阻塞，直到信号到达。
+    let mut buf = [0u8; 8];
+    match libsys::read(r, &mut buf) {
+        Err(libsys::Error::Interrupted) => {
+            let _ = write(STDOUT, b"[sig] blocked read interrupted with EINTR OK\n");
+        }
+        Ok(n) => {
+            ok = false;
+            let mut b = [0u8; 8];
+            let _ = write(STDOUT, b"[sig] read returned Ok(n=");
+            let _ = write(STDOUT, dec_u64(n, &mut b));
+            let _ = write(STDOUT, b") instead of EINTR\n");
+        }
+        Err(_) => {
+            ok = false;
+            let _ = write(STDOUT, b"[sig] read failed with a non-EINTR error\n");
+        }
+    }
+    if SIG_HANDLER_RAN.load(Ordering::SeqCst) == 1 {
+        let _ = write(STDOUT, b"[sig] SIGUSR1 handler ran OK\n");
+    } else {
+        ok = false;
+        let _ = write(STDOUT, b"[sig] handler did NOT run\n");
+    }
+    // 清理：关写端 → 子进程侧的读端语义恢复；收尸子进程。
+    let _ = libsys::close(w);
+    let _ = libsys::close(r);
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == child => {
+                let _ = write(STDOUT, b"[sig] signaller reaped\n");
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                spins += 1;
+                if spins > 4_000_000 {
+                    break;
+                }
+                yield_now();
+            }
+        }
+    }
+    let _ = write(STDOUT, if ok { b"[sig] PASS\n" as &[u8] } else { b"[sig] FAIL\n" });
+}
+
+/// 解析 `--signal-pid=N`（3P4-9 验收的子进程侧入口）。
+fn signal_pid_arg(argc: isize, argv: *const *const u8) -> Option<usize> {
+    let c = unsafe { libsys::cmdline(argc, argv) }?;
+    let s = c.strip_prefix(b"--signal-pid=")?;
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: usize = 0;
+    for b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.saturating_mul(10).saturating_add((b - b'0') as usize);
+    }
+    Some(n)
+}
+
 /// 解析 `--read-fd=N`（3P4-3 验收的子进程侧入口）。
 ///
 /// 走 libsys 的入口参数单点（`cmdline`）——shell 派生时已剥去程序名，
@@ -1217,11 +1345,34 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         };
     }
 
+    // 3P4-9 验收的**子进程侧**入口：`selftest --signal-pid=N` —— 稍后向 N 发 SIGUSR1。
+    // 延迟是必需的：要确保父进程**已经阻塞在 read 上**，否则信号先到、父还没进阻塞，
+    // 测的就不是 EINTR 而是「返回用户态时的投递」。
+    if let Some(pid) = signal_pid_arg(argc, argv) {
+        // 延迟 2 秒：父进程在 spawn（要从光盘读 ELF）之后才进 read，100ms 不够——
+        // 信号若在阻塞**之前**到达，POSIX 语义下本就不产生 EINTR（那次调用照常阻塞），
+        // 于是用例会假失败。等待必须长到父进程确实已经在 read 上阻塞。
+        let t0 = libsys::now();
+        while libsys::now().saturating_sub(t0) < 2_000_000_000 {
+            yield_now();
+        }
+        match libsys::kill(pid as u64, libsys::signal::SIGUSR1 as u64) {
+            Ok(_) => {
+                let _ = write(STDOUT, b"[sig] child: signalled parent\n");
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[sig] child: kill FAILED\n");
+            }
+        }
+        return 0;
+    }
+
     let audio = group_enabled(argc, argv, b"audio");
     let thread = group_enabled(argc, argv, b"thread");
     let quick = group_enabled(argc, argv, b"quick");
     let fs = group_enabled(argc, argv, b"fs");
     let mm = group_enabled(argc, argv, b"mm");
+    let sig = group_enabled(argc, argv, b"sig");
     let _ = write(STDOUT, b"[selftest] start (group=");
     // 回显**实际生效**的组名：与 group_enabled 同源（argv[0]），不是 argv[1]。
     // 无参或空串时回显 all——与 group_enabled 返回 true 的语义一致。
@@ -1273,6 +1424,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     }
     if mm {
         mm_selftest();
+    }
+    if sig {
+        sig_selftest();
     }
     if audio {
         audio_e2e_launch();
