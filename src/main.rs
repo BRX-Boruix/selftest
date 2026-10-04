@@ -1084,8 +1084,28 @@ fn sig_selftest() {
         }
     };
     // 阻塞读：写端开着、无数据 → 真正阻塞，直到信号到达。
+    // 注意（实测教训）：**无可调度同伴时内核如实返回 WouldBlock**（既有契约），此时并未
+    // 阻塞——信号到达时进程早已离开那次调用，于是既不会有 EINTR 也不会有 handler 投递。
+    // 故按 POSIX 惯例对 WouldBlock 重试，直到真正阻塞并被信号打断（或超时）。
     let mut buf = [0u8; 8];
-    match libsys::read(r, &mut buf) {
+    let t_start = libsys::now();
+    let mut outcome: Result<usize, libsys::Error> = Err(libsys::Error::WouldBlock);
+    loop {
+        match libsys::read(r, &mut buf) {
+            Err(libsys::Error::WouldBlock) => {
+                if libsys::now().saturating_sub(t_start) > 5_000_000_000 {
+                    outcome = Err(libsys::Error::WouldBlock);
+                    break;
+                }
+                yield_now();
+            }
+            other => {
+                outcome = other;
+                break;
+            }
+        }
+    }
+    match outcome {
         Err(libsys::Error::Interrupted) => {
             let _ = write(STDOUT, b"[sig] blocked read interrupted with EINTR OK\n");
         }
