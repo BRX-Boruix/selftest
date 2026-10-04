@@ -1019,6 +1019,85 @@ fn mm_selftest() {
     let _ = write(STDOUT, if ok { b"[mm] PASS\n" as &[u8] } else { b"[mm] FAIL\n" });
 }
 
+/// 3P4-3b 验收：**写端进程退出 → 读端 EOF**（进程退出时归还 fd 表的管道引用）。
+///
+/// 构造：父建管道 → 子进程继承两端后立即退出 → 父关掉**自己的**写端。
+/// 此后唯一写端是子进程继承的那份；若退出路径不归还引用，写端存活数永不归零，
+/// 父进程永远等不到 EOF（POSIX 语义缺口）。用非阻塞轮询（有界，缺陷时不挂死）。
+fn pipe_exit_eof_selftest() {
+    let mut ok = true;
+    let (r, w) = match libsys::pipe_create() {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = write(STDOUT, b"[peof] pipe_create failed\n");
+            let _ = write(STDOUT, b"[peof] FAIL\n");
+            return;
+        }
+    };
+    let child = match libsys::exec_path("/programs/selftest.elf", b"--exit-now") {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = write(STDOUT, b"[peof] spawn failed\n");
+            let _ = write(STDOUT, b"[peof] FAIL\n");
+            return;
+        }
+    };
+    // 父关自己的写端：此后唯一写端是子进程继承的那份。
+    let _ = libsys::close(w);
+    // 收尸子进程，确保它已退出（其 fd 应由退出路径释放）。
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == child => break,
+            Ok(_) => {}
+            Err(_) => {
+                spins += 1;
+                if spins > 20_000 {
+                    break;
+                }
+                yield_now();
+            }
+        }
+    }
+    // 非阻塞轮询读：必须得到 0（EOF）。
+    let mut buf = [0u8; 8];
+    let t0 = libsys::now();
+    let mut got: Option<usize> = None;
+    loop {
+        match libsys::read_nonblocking(r, &mut buf) {
+            Ok(n) => {
+                got = Some(n);
+                break;
+            }
+            Err(libsys::Error::WouldBlock) => {
+                if libsys::now().saturating_sub(t0) > 5_000_000_000 {
+                    break;
+                }
+                yield_now();
+            }
+            Err(_) => break,
+        }
+    }
+    match got {
+        Some(0) => {
+            let _ = write(STDOUT, b"[peof] reader saw EOF after writer process exited OK\n");
+        }
+        Some(n) => {
+            ok = false;
+            let mut b = [0u8; 8];
+            let _ = write(STDOUT, b"[peof] read returned ");
+            let _ = write(STDOUT, dec_u64(n as u64, &mut b));
+            let _ = write(STDOUT, b" bytes (expected EOF 0)\n");
+        }
+        None => {
+            ok = false;
+            let _ = write(STDOUT, b"[peof] no EOF within 5s (write-end refs leaked?)\n");
+        }
+    }
+    let _ = libsys::close(r);
+    let _ = write(STDOUT, if ok { b"[peof] PASS\n" as &[u8] } else { b"[peof] FAIL\n" });
+}
+
 /// 3P4-9 判定用例：**阻塞读被数据唤醒时，必须拿到数据本身**（而不是 syscall 调用号）。
 ///
 /// 背景：入口 stub 的成文注释（interrupts.rs:748-753）说明——阻塞类 syscall 的帧会被存进
@@ -1501,6 +1580,14 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         return 0;
     }
 
+    // 3P4-3b 验收用子进程：`selftest --exit-now` —— 继承父的 fd（含管道端）后立即退出，
+    // 用于验证「退出路径归还 fd 表的资源引用」。
+    if let Some(c) = unsafe { libsys::cmdline(argc, argv) } {
+        if c == b"--exit-now" {
+            return 0;
+        }
+    }
+
     if let Some(pid) = signal_pid_arg(argc, argv) {
         // 延迟 2 秒：父进程在 spawn（要从光盘读 ELF）之后才进 read，100ms 不够——
         // 信号若在阻塞**之前**到达，POSIX 语义下本就不产生 EINTR（那次调用照常阻塞），
@@ -1579,6 +1666,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         mm_selftest();
     }
     if sig {
+        pipe_exit_eof_selftest();
         pipe_wake_selftest();
         sig_selftest();
     }
