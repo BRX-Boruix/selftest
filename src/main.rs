@@ -840,12 +840,208 @@ fn group_enabled(argc: isize, argv: *const *const u8, g: &[u8]) -> bool {
     same
 }
 
+/// 解析 `--read-fd=N`（3P4-3 验收的子进程侧入口）。
+///
+/// 走 libsys 的入口参数单点（`cmdline`）——shell 派生时已剥去程序名，
+/// 故 argv[0] 就是参数串本身。
+fn read_fd_arg(argc: isize, argv: *const *const u8) -> Option<u64> {
+    let c = unsafe { libsys::cmdline(argc, argv) }?;
+    let s = c.strip_prefix(b"--read-fd=")?;
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.saturating_mul(10).saturating_add((b - b'0') as u64);
+    }
+    Some(n)
+}
+
+/// 3P4-3 / 3P4-8 的用户态端到端验收（`selftest fs`）。
+///
+/// 覆盖四项：
+/// 1. symlink -> readlink 往返（根是可写 RamFS，ramfs 实现了 symlink）；
+/// 2. ftruncate 改大小并用 fstat 复核（11 -> 2 -> 0）；
+/// 3. **CLOEXEC 管道 EOF**：父建 CLOEXEC 管道 -> spawn 自身读该 fd -> 父关两端 ->
+///    子进程必须读到 EOF（若写端被子进程继承，这里读不到 EOF）；
+/// 4. CPU 数取值（sysfs /system/info/cpu -> libsys::info(INFO_CPU_COUNT)）。
+fn fs_selftest() {
+    let mut ok = true;
+
+    // ---- 1. symlink -> readlink ----
+    let link = "/fs-selftest-link";
+    let target = "/programs/fpcheck.elf";
+    match libsys::symlink(target, link) {
+        Ok(()) => match libsys::readlink(link) {
+            Ok(t) if t == target => {
+                let _ = write(STDOUT, b"[fs] symlink/readlink round-trip OK\n");
+            }
+            Ok(t) => {
+                ok = false;
+                let _ = write(STDOUT, b"[fs] readlink mismatch: ");
+                let _ = write(STDOUT, t.as_bytes());
+                let _ = write(STDOUT, b"\n");
+            }
+            Err(_) => {
+                ok = false;
+                let _ = write(STDOUT, b"[fs] readlink failed\n");
+            }
+        },
+        Err(_) => {
+            ok = false;
+            let _ = write(STDOUT, b"[fs] symlink failed\n");
+        }
+    }
+
+    // ---- 2. ftruncate + fstat ----
+    let path = "/fs-selftest-file";
+    match libsys::open(
+        path,
+        libsys::OpenFlags::CREATE_OR_TRUNCATE,
+        libsys::Permissions::read_write(),
+    ) {
+        Ok(fd) => {
+            let _ = libsys::write(fd, b"hello world"); // 11 字节
+            let size = |fd: u64| -> Option<u64> { libsys::fstat(fd).ok().map(|s| s.size) };
+            let s0 = size(fd);
+            let r1 = libsys::ftruncate(fd, 2).is_ok() && size(fd) == Some(2);
+            let r2 = libsys::ftruncate(fd, 0).is_ok() && size(fd) == Some(0);
+            if s0 == Some(11) && r1 && r2 {
+                let _ = write(STDOUT, b"[fs] ftruncate 11->2->0 with fstat OK\n");
+            } else {
+                ok = false;
+                let _ = write(STDOUT, b"[fs] ftruncate/fstat mismatch\n");
+            }
+            let _ = libsys::close(fd);
+        }
+        Err(_) => {
+            ok = false;
+            let _ = write(STDOUT, b"[fs] create failed\n");
+        }
+    }
+
+    // ---- 3. CLOEXEC 管道 EOF ----
+    match libsys::pipe_create_cloexec() {
+        Ok((r, w)) => {
+            // 子进程必须**能读**、但**不能持有写端**——而 pipe_create_cloexec 把两端
+            // 都标了 CLOEXEC。POSIX 的解法：把读端 dup 到新 fd（**dup 清除 FD_CLOEXEC**），
+            // 于是新 fd 可继承、写端仍 CLOEXEC 并被 exec 丢弃。
+            const CHILD_FD: u64 = 9;
+            if libsys::dup2(r, CHILD_FD).is_err() {
+                ok = false;
+                let _ = write(STDOUT, b"[fs] dup2 for child fd failed\n");
+            }
+            // 手写十进制拼参数串（本 crate 未链 alloc，不用 format!）。
+            let mut cmd = [0u8; 24];
+            let prefix = b"--read-fd=";
+            cmd[..prefix.len()].copy_from_slice(prefix);
+            let mut n = CHILD_FD;
+            let mut digits = [0u8; 20];
+            let mut i = 0usize;
+            if n == 0 {
+                digits[0] = b'0';
+                i = 1;
+            }
+            while n > 0 {
+                digits[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                i += 1;
+            }
+            let mut j = prefix.len();
+            while i > 0 {
+                i -= 1;
+                cmd[j] = digits[i];
+                j += 1;
+            }
+            let cmd = &cmd[..j];
+            match libsys::exec_path("/programs/selftest.elf", cmd) {
+                Ok(pid) => {
+                    // 父关**全部**读端与写端：此刻系统里若仍有写端，必是子进程继承了它
+                    // （那正是本用例要抓的缺陷）。
+                    let _ = libsys::close(w);
+                    let _ = libsys::close(r);
+                    let _ = libsys::close(CHILD_FD);
+                    let mut code: Option<i32> = None;
+                    let mut spins: u32 = 0;
+                    while code.is_none() && spins < 4_000_000 {
+                        match waitpid_any() {
+                            Ok(wr) if wr.pid == pid => code = Some(wr.code as i32),
+                            Ok(_) => {}
+                            Err(_) => {
+                                spins += 1;
+                                yield_now();
+                            }
+                        }
+                    }
+                    if code == Some(0) {
+                        let _ = write(STDOUT, b"[fs] CLOEXEC pipe EOF OK\n");
+                    } else {
+                        ok = false;
+                        let _ = write(STDOUT, b"[fs] CLOEXEC pipe EOF FAILED\n");
+                    }
+                }
+                Err(_) => {
+                    ok = false;
+                    let _ = write(STDOUT, b"[fs] spawn self failed\n");
+                }
+            }
+        }
+        Err(_) => {
+            ok = false;
+            let _ = write(STDOUT, b"[fs] pipe_create_cloexec failed\n");
+        }
+    }
+
+    // ---- 4. CPU 数 ----
+    match libsys::info(libsys::nr::INFO_CPU_COUNT) {
+        Ok(n) if n >= 1 => {
+            let mut b = [0u8; 8];
+            let _ = write(STDOUT, b"[fs] cpu_count=");
+            let _ = write(STDOUT, dec_u64(n, &mut b));
+            let _ = write(STDOUT, b"\n");
+        }
+        _ => {
+            ok = false;
+            let _ = write(STDOUT, b"[fs] cpu_count unavailable\n");
+        }
+    }
+
+    let _ = write(STDOUT, if ok { b"[fs] PASS\n" as &[u8] } else { b"[fs] FAIL\n" });
+}
+
 /// libsys `_start` 按符号名找 `user_main`，必须有 `#[unsafe(no_mangle)]`。
 #[unsafe(no_mangle)]
 pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
+    // 3P4-3 验收的**子进程侧**入口：`selftest --read-fd=N` —— 读 fd N 直到 EOF。
+    // 必须最先判定：子进程只做这一件事，不应跑整套用例。
+    if let Some(n) = read_fd_arg(argc, argv) {
+        let mut buf = [0u8; 16];
+        return match libsys::read(n, &mut buf) {
+            Ok(0) => {
+                let _ = write(STDOUT, b"[fs] child: EOF as expected\n");
+                0
+            }
+            Ok(k) => {
+                let mut b = [0u8; 8];
+                let _ = write(STDOUT, b"[fs] child: unexpected data len=");
+                let _ = write(STDOUT, dec_u64(k as u64, &mut b));
+                let _ = write(STDOUT, b"\n");
+                1
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[fs] child: read failed\n");
+                2
+            }
+        };
+    }
+
     let audio = group_enabled(argc, argv, b"audio");
     let thread = group_enabled(argc, argv, b"thread");
     let quick = group_enabled(argc, argv, b"quick");
+    let fs = group_enabled(argc, argv, b"fs");
     let _ = write(STDOUT, b"[selftest] start (group=");
     // 回显**实际生效**的组名：与 group_enabled 同源（argv[0]），不是 argv[1]。
     // 无参或空串时回显 all——与 group_enabled 返回 true 的语义一致。
@@ -891,6 +1087,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // ADR-038 U1/D5：真实 C 用户态 fork()+waitpid() 端到端（零 Rust libc），
         // 经 shell 非交互模式（argv = 整行命令）拉起，与用户手敲同路径。
         forkdemo_launch();
+    }
+    if fs {
+        fs_selftest();
     }
     if audio {
         audio_e2e_launch();
