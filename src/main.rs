@@ -1547,6 +1547,7 @@ fn fs_selftest() {
                     let _ = libsys::close(w);
                     let _ = libsys::close(r);
                     let _ = libsys::close(CHILD_FD);
+                    let _ = write(STDOUT, b"[fs] parent closed r/w/9\n");
                     let mut code: Option<i32> = None;
                     let mut spins: u32 = 0;
                     while code.is_none() && spins < 4_000_000 {
@@ -1603,23 +1604,43 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 必须最先判定：子进程只做这一件事，不应跑整套用例。
     if let Some(n) = read_fd_arg(argc, argv) {
         let mut buf = [0u8; 16];
-        return match libsys::read(n, &mut buf) {
+        // **ADR-052 契约：阻塞 syscall 被唤醒时不续跑，如实返回 WouldBlock(EAGAIN)，调用方重试。**
+        // 本系统的阻塞用「帧交换」实现（无内核上下文切换），被唤醒的 syscall 不会继续执行——
+        // 它回到用户态时 rax 被写成 EAGAIN，语义是「本次等待未完成，请重试」。
+        //
+        // **这是本用例此前『通过』的真相**：早先父进程总是先关写端，读者直接走 EOF 分支、
+        // 根本不需要阻塞，于是从不触发 EAGAIN——那是**依赖时序的伪绿**，不是真的验证了 CLOEXEC。
+        // 一旦子进程先跑（先读、后父关写端），就必须阻塞，也就必须重试。故这里按契约重试。
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            match libsys::read(n, &mut buf) {
             Ok(0) => {
                 let _ = write(STDOUT, b"[fs] child: EOF as expected\n");
-                0
+                return 0;
             }
             Ok(k) => {
                 let mut b = [0u8; 8];
                 let _ = write(STDOUT, b"[fs] child: unexpected data len=");
                 let _ = write(STDOUT, dec_u64(k as u64, &mut b));
                 let _ = write(STDOUT, b"\n");
-                1
+                return 1;
             }
-            Err(_) => {
-                let _ = write(STDOUT, b"[fs] child: read failed\n");
-                2
+            Err(libsys::Error::WouldBlock) if attempts < 1_000_000 => {
+                // 被唤醒（或未能入睡）：让出后重试。
+                yield_now();
             }
-        };
+            Err(e) => {
+                let mut b = [0u8; 8];
+                let _ = write(STDOUT, b"[fs] child: read failed fd=");
+                let _ = write(STDOUT, dec_u64(n, &mut b));
+                let _ = write(STDOUT, b" errno=");
+                let _ = write(STDOUT, dec_u64(e.to_errno() as u64, &mut b));
+                let _ = write(STDOUT, b"\n");
+                return 2;
+            }
+            }
+        }
     }
 
     // 3P4-9 验收的**子进程侧**入口：`selftest --signal-pid=N` —— 稍后向 N 发 SIGUSR1。
