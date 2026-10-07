@@ -1397,9 +1397,63 @@ fn read_fd_arg(argc: isize, argv: *const *const u8) -> Option<u64> {
 /// 3. **CLOEXEC 管道 EOF**：父建 CLOEXEC 管道 -> spawn 自身读该 fd -> 父关两端 ->
 ///    子进程必须读到 EOF（若写端被子进程继承，这里读不到 EOF）；
 /// 4. CPU 数取值（sysfs /system/info/cpu -> libsys::info(INFO_CPU_COUNT)）。
+/// O_EXCL 独占创建自检（POSIX 原子性）。
+///
+/// **为什么是独立函数、且在 `fs_selftest` 的**最前面**跑**：本项与后面各节**没有依赖**，
+/// 而 2026-10 实测第 3 节（CLOEXEC 管道）会在系统内挂起——把它放在末尾就等于永远跑不到，
+/// 验收证据是空的。让它先跑，是为了让**它自己的结论**不被别人的失败掩盖（S09：证据要真的
+/// 覆盖到被测项，而不是「跑了整套所以大概没问题」）。CLOEXEC 的挂起另案登记，不在此掩盖。
+fn open_excl_check(ok: &mut bool) {
+    // 真实数据链路：libsys::open(create|exclusive) → 内核 sys_open 的 exclusive 分支。
+    // 三条断言，缺一不可：
+    //  (a) 路径不存在 + create|exclusive ⇒ 成功（文件真被创建）；
+    //  (b) 同一路径再次 create|exclusive ⇒ **AlreadyExists**（而不是打开已有文件）；
+    //  (c) 不带 exclusive 的普通打开 ⇒ 仍能打开已存在文件（独占位不误伤普通语义）。
+    // 只测 (b) 是不够的：(b) 用「任何错误」都能蒙对，必须同时钉住 (a)(c)。
+    let p = "/fs-selftest-excl";
+    // 先清理上次运行（同一镜像上 selftest 可能重跑多次）。
+    let _ = libsys::unlink(p);
+    let excl = libsys::OpenFlags {
+        read: true,
+        write: true,
+        create: true,
+        truncate: false,
+        append: false,
+        directory: false,
+        pipe: false,
+        cloexec: false,
+        exclusive: true,
+    };
+    let first = libsys::open(p, excl, libsys::Permissions::read_write());
+    let second = libsys::open(p, excl, libsys::Permissions::read_write());
+    let plain = libsys::open(p, libsys::OpenFlags::READ_ONLY, libsys::Permissions::readonly());
+    let ok_first = first.is_ok();
+    let ok_second = matches!(second, Err(libsys::Error::AlreadyExists));
+    let ok_plain = plain.is_ok();
+    if let Ok(fd) = first {
+        let _ = libsys::close(fd);
+    }
+    if let Ok(fd) = plain {
+        let _ = libsys::close(fd);
+    }
+    if ok_first && ok_second && ok_plain {
+        let _ = write(STDOUT, b"[fs] O_EXCL exclusive-create OK\n");
+    } else {
+        *ok = false;
+        let _ = write(STDOUT, b"[fs] O_EXCL FAILED (create/exist/plain)=");
+        let _ = write(STDOUT, if ok_first { b"1" } else { b"0" });
+        let _ = write(STDOUT, if ok_second { b"1" } else { b"0" });
+        let _ = write(STDOUT, if ok_plain { b"1" } else { b"0" });
+        let _ = write(STDOUT, b"\n");
+    }
+    let _ = libsys::unlink(p);
+}
+
 fn fs_selftest() {
     let mut ok = true;
 
+    // ---- 0. O_EXCL 独占创建：**先跑**（理由见 open_excl_check 的文档）。
+    open_excl_check(&mut ok);
     // ---- 1. symlink -> readlink ----
     let link = "/fs-selftest-link";
     let target = "/programs/fpcheck.elf";
@@ -1537,6 +1591,7 @@ fn fs_selftest() {
             let _ = write(STDOUT, b"[fs] cpu_count unavailable\n");
         }
     }
+
 
     let _ = write(STDOUT, if ok { b"[fs] PASS\n" as &[u8] } else { b"[fs] FAIL\n" });
 }
